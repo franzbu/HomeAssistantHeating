@@ -12,6 +12,12 @@ This is a screenshot of a possible HA dashboard with two example rooms (the firs
 
 If heating is set to `Off` (top left), it stays off; if it is set to `Party`, it stays on. However, it is the two options in between, `Auto` and `Heating`, where the magic happens.
 
+## Requirements
+
+This heating automation requires a [HA Climate entity](https://www.home-assistant.io/integrations/climate/) for each room, which HA creates automatically for any thermostat, or, more broadly speaking, any temperature sensor and valve combination. This is the entry point. The exit point for this automation is simply a number: 0 if no heating is required or the temperature of the heating fluid flow temperature that is to be sent through the pipelines.
+
+## Basics
+
 The one goal of this heating automation has been 'set up and forget'. The house ideally heats itself to the desired temperature, taking into consideration premeditated factors such as personal circumstances (work, holiday at home, gone), purpose of room, day of week, time of day, or time of year. Even factors such as the current sun exposure can play a role and can optionally be taken into consideration by this heating automation.
 
 The present heating automation works regardless of which kind of heating system is in place; it is divided into three abstraction layers: 
