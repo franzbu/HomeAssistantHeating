@@ -126,7 +126,7 @@ schedule.temp_stubbe
 schedule.off_stubbe
 
 input_select.heating_schedule_stubbe: Standard, Holiday, Party, Temporary, Off, Google Calendar
-input_select.default_heating_schedule_stubbe: Standard, Holiday, Party, Temporary, Off, Google Calendar
+input_select.default_heating_schedule_stubbe: Standard, Holiday, Party, Temporary, Off, Google Calendar (user determines default schedule each room is reset to every day at midnight)
 input_select.heating_claim_stubbe
 
 input_number.target_temp_stubbe: 5-30 (0.5 steps)
@@ -354,6 +354,16 @@ template:
         attributes:
           events: "{{ agenda['calendar.heating_stubbe']['events'] if agenda is defined else [] }}"
 ```
+
+#### Heating Modes
+
+`input_select.heating_modes`
+1. **Off:** Heating is off and stays off
+2. **Pause:** Heating is paused until midnight; at midnight it switches to `Auto`
+3. **Auto:** Heating starts and stops automatically according to the room's heating demands
+4. **Heating:** Currently heating, switches to `Auto` when all room drop their heating command
+6. **Party:** Heating stays on until all heating circuit valves are below 15%
+7. **OnFire:** (optional) heating stays on until the boiler switches off (in case user wants to avoid the boiler staying in maintenance mode)
 
 #### Schedule Adjustment
 
