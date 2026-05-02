@@ -56,7 +56,6 @@ This heating control system has been built with **AppDaemon** (Python). Why AppD
 │   └── B1200522_ModBus Lambdatronic 3200_50-04_05-19_de.pdf
 ├── 📂 firmware
 │   └── ESP32-P4-ETH_Froeling_Lambdatronic3200.yml
-    └── ESP32-P4-NANO_Froeling_Lambdatronic3200.yml
 └── 📂 HA
     ├── automation_climate_sync_select_bedroom.yaml
     ├── script_heating_delta_minus_input_number.yaml
@@ -126,7 +125,8 @@ schedule.party_stubbe
 schedule.temp_stubbe
 schedule.off_stubbe
 
-input_select.heating_schedule_stubbe: Standard, Holiday, Party, Temporary, Off
+input_select.heating_schedule_stubbe: Standard, Holiday, Party, Temporary, Off, Google Calendar
+input_select.default_heating_schedule_stubbe: Standard, Holiday, Party, Temporary, Off, Google Calendar
 input_select.heating_claim_stubbe
 
 input_number.target_temp_stubbe: 5-30 (0.5 steps)
@@ -246,6 +246,114 @@ The schedules are the heart of the automation. The system follows the logic of t
 3.  **Party:** Overrides timers for extended comfort.
 4.  **Temporary:** Short-term adjustments.
 5.  **Off:** Frost protection only (Target set to 5°C).
+6.  **Google Calendar** Google Calendar can be used; it can be synced to HA via Google Apps Script and Home Assistant Automation. Name the calendars heating_room-name.
+
+Google Apps Script:
+```Python
+const WEBHOOK_URL = "https://<your_ha_url>/api/webhook/gc_to_ha";
+
+function pushToHomeAssistant(e) {
+  const options = {
+    'method' : 'post',
+    'contentType': 'application/json',
+    'payload' : JSON.stringify({
+      "source": "google_apps_script",
+      "action": "calendar_updated",
+      "calendarId": e ? e.calendarId : "manual_test"
+    }),
+    'muteHttpExceptions': true    
+  };
+
+  try {
+    const response = UrlFetchApp.fetch(WEBHOOK_URL, options);
+    console.log("Webhook fired. Response Code: " + response.getResponseCode());
+  } catch (error) {
+    console.error("Failed to send webhook: " + error);
+  }
+} 
+
+function setupAllHeatingTriggers() {
+  // 1. Clear existing triggers so we don't create duplicates
+  const triggers = ScriptApp.getProjectTriggers();
+  for (let i = 0; i < triggers.length; i++) {
+    ScriptApp.deleteTrigger(triggers[i]);
+  }
+
+  // 2. Find all your calendars
+  const calendars = CalendarApp.getAllOwnedCalendars();
+  let triggerCount = 0;
+  
+  // 3. Loop through them and create a trigger for the heating ones
+  for (let i = 0; i < calendars.length; i++) {
+    const cal = calendars[i];
+    const calName = cal.getName();
+    
+    // Check if the calendar name starts with "heating_"
+    if (calName.startsWith("heating_")) {
+      ScriptApp.newTrigger("pushToHomeAssistant")
+        .forUserCalendar(cal.getId())
+        .onEventUpdated()
+        .create();
+      console.log("Successfully created trigger for: " + calName);
+      triggerCount++;
+    }
+  }
+  
+  console.log("Done! Created " + triggerCount + " triggers.");
+}
+```
+
+Home Assistant Automation (necessary for one room only):
+```yaml
+alias: Google Calendar Webhook Receiver
+description: >-
+  Catches signals from Google Apps Script to refresh heating (source Google
+  Calendar, destination HA)
+triggers:
+  - trigger: webhook
+    allowed_methods:
+      - POST
+      - PUT
+    local_only: false
+    webhook_id: gc_to_ha
+conditions: []
+actions:
+  - action: homeassistant.reload_config_entry
+    target:
+      entity_id: calendar.heating_stubbe
+  - delay:
+      hours: 0
+      minutes: 0
+      seconds: 10
+      milliseconds: 0
+  - event: HEATING_CALENDAR_SYNC
+mode: single
+```
+
+Add to Home Assistant's configuration.yaml for each room separately; substitute 'stubbe' with the names of your rooms:
+```yaml
+template:
+  # --- STUBBE ---
+  - trigger:
+      - platform: time_pattern
+        hours: /3
+      - platform: event
+        event_type: HEATING_CALENDAR_SYNC
+    action:
+      - action: calendar.get_events
+        data:
+          duration:
+            days: 7
+        target:
+          entity_id: calendar.heating_stubbe
+        response_variable: agenda
+    sensor:
+      - name: "Calendar Events Stubbe"
+        unique_id: calendar_events_stubbe
+        state: "{{ agenda['calendar.heating_stubbe']['events'] | count if agenda is defined else 0 }}"
+        attributes:
+          events: "{{ agenda['calendar.heating_stubbe']['events'] if agenda is defined else [] }}"
+```
 
 #### Schedule Adjustment
 
@@ -421,14 +529,12 @@ The ESP is programmed to listen to changes to HA's input_number.target_flow_temp
     <img src="https://github.com/user-attachments/assets/12582661-d97b-43ec-b185-a310ce84cf0c" height="300" />
 </p>
 
-The [firmware for the Waveshare ESP32-P4-ETH](https://github.com/franzbu/HomeAssistantHeating/blob/main/firmware/ESP32-P4-ETH_Froeling_Lambdatronic3200.yml) can easily be adapted to other ESPs (it contains a few lines of code for an additional irrigation valve, which can be removed if not useful). Another example can be seen below.
+The [firmware for the Waveshare ESP32-P4-ETH](https://github.com/franzbu/HomeAssistantHeating/blob/main/firmware/ESP32-P4-ETH_Froeling_Lambdatronic3200.yml) can easily be adapted to other ESPs (it contains a few lines of code for an additional irrigation valve, which can be removed if not useful). 
 
 <p float="left">
   <img src="https://github.com/user-attachments/assets/29b461ea-b1f1-4f5a-834e-1a129d0c9ae3" height="300" />
   <img src="https://github.com/user-attachments/assets/b3757574-4caf-4d44-88d6-aee97cdbc305" height="300" />
 </p>
-
-[Here](https://github.com/franzbu/HomeAssistantHeating/blob/main/firmware/ESP32-P4-NANO_Froeling_Lambdatronic3200.yml) is the firmware for the Waveshare ESP32-P4-NANO.
 
 To connect to the aforementioned Froeling SP Dual via Modbus, a TTL to RS232 converter is needed; the Waveshare Rail-Mount TTL To RS232 Galvanic Isolated Converter is a recommended choice for its interference immunity.
 
