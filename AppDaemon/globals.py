@@ -35,13 +35,12 @@ class GlobalSettings(hass.Hass):
         return mapping.get(f"valve_{room_alias}") or mapping.get(room_alias)
 
 
-    def send_telegram(self, target, title, message, disable_notification):
+    def send_telegram(self, chat_id, title, message, disable_notification):
         """
         Centralized Telegram notification service.
-        Parameters: title (str), message (str), target (int/str), disable_notification (bool)
         """
         self.call_service("telegram_bot/send_message", service_data={
-            "target": target, 
+            "chat_id": chat_id, # Match the variable name above
             "title": title,
             "message": message,
             "disable_notification": disable_notification
