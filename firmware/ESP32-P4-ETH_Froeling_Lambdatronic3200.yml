@@ -5,9 +5,9 @@ esphome:
   on_boot:
     - priority: -15 
       then:
+        - delay: 5s
         - component.update: lambdatronic 
         - delay: 2s
-        # Initial check on boot
         - binary_sensor.template.publish:
             id: modbus_status
             state: !lambda 'return !std::isnan(id(boiler_temp_actual).state);'
@@ -60,11 +60,15 @@ globals:
   - id: internal_schedule_target
     type: float
     initial_value: '0.0'
+  - id: stubbe_heating_active
+    type: bool
+    initial_value: 'true'
 
 # ----------------------------------------------------------------------
-# 1. CONNECTIVITY (ESP32-P4 IP101 HARDWARE)
+# 1. CONNECTIVITY
 # ----------------------------------------------------------------------
 ethernet:
+  id: eth_link
   type: IP101
   phy_addr: 1
   mdc_pin: GPIO31
@@ -98,18 +102,19 @@ modbus_controller:
     update_interval: 30s
 
 # ----------------------------------------------------------------------
-# 2. WATCHDOG & FAIL-SAFE LOGIC
+# 2. WATCHDOG
 # ----------------------------------------------------------------------
 api:
   reboot_timeout: 0s
   on_client_disconnected:
-    - logger.log: "API Disconnected! Forcing Fail-Safe."
-    - lambda: |-
-        if (id(boiler_being_poked).state) {
-          id(heating_countdown_seconds) = id(safety_countdown_start_val);
-          id(esp_status).update(); 
-          ESP_LOGW("custom", "API Connection lost while heating. Entering Countdown mode.");
-        }
+    then:
+      - logger.log: "API Disconnected! Forcing Fail-Safe."
+      - lambda: |-
+          if (id(boiler_being_poked).state) {
+            id(heating_countdown_seconds) = id(safety_countdown_start_val);
+            id(esp_status).update(); 
+            ESP_LOGW("custom", "API Connection lost while heating. Entering Countdown mode.");
+          }
 
 # ----------------------------------------------------------------------
 # 3. SCRIPTS
@@ -170,17 +175,40 @@ script:
             }
 
             if (schedule_active) {
-              float outside;
-              if (!std::isnan(id(dallas_outside_temp).state)) outside = id(dallas_outside_temp).state;
-              else if (!std::isnan(id(outside_temp_sensor).state)) outside = id(outside_temp_sensor).state;
-              else outside = 0.0f;
-                          
-              float y1 = id(curve_minus_10).state;
-              float y2 = id(curve_plus_10).state;
-              float x1 = id(curve_out_low);
-              float x2 = id(curve_out_high);
+              float stubbe_t = id(hm_stubbe_temp).state;
+              float target_t = id(stubbe_target_temp).state;
+              float delta_t = id(stubbe_delta).state;
+              float margin_t = id(stubbe_margin).state;
               
-              calculated_target = y1 + ((outside - x1) * (y2 - y1) / (x2 - x1)) + base_offset;
+              if (!std::isnan(stubbe_t)) {
+                if (stubbe_t >= (target_t - margin_t)) {
+                  id(stubbe_heating_active) = false;
+                } else if (stubbe_t < (target_t - delta_t)) {
+                  id(stubbe_heating_active) = true;
+                }
+              } else {
+                id(stubbe_heating_active) = true; 
+              }
+              
+              if (id(stubbe_heating_active)) {
+                float outside;
+                if (!std::isnan(id(dallas_outside_temp).state)) outside = id(dallas_outside_temp).state;
+                else if (!std::isnan(id(outside_temp_sensor).state)) outside = id(outside_temp_sensor).state;
+                else outside = 0.0f;
+                            
+                float y1 = id(curve_minus_10).state;
+                float y2 = id(curve_plus_10).state;
+                float x1 = id(curve_out_low);
+                float x2 = id(curve_out_high);
+                
+                if (fabs(x2 - x1) > 0.001f) {
+                  calculated_target = y1 + ((outside - x1) * (y2 - y1) / (x2 - x1)) + base_offset;
+                } else {
+                  calculated_target = y1 + base_offset; 
+                }
+              } else {
+                calculated_target = 0.0; 
+              }
             }
           }
           id(internal_schedule_target) = calculated_target;
@@ -199,17 +227,9 @@ script:
           }
 
 # ----------------------------------------------------------------------
-# 4. PRIMARY CONTROLS
+# 4. PRIMARY CONTROLS & RECEIVERS
 # ----------------------------------------------------------------------
 text:
-  - platform: template
-    name: "Valve Schedule"
-    id: valve_schedule
-    mode: text
-    optimistic: true
-    restore_value: true
-    icon: "mdi:calendar-clock"
-
   - platform: template
     name: "Time (Manual Override)"
     id: manual_time_input
@@ -277,6 +297,188 @@ text:
     restore_value: true
 
 number:
+  # --- BACKEND RECEIVERS (Hidden in Diagnostics) ---
+  - platform: template
+    id: rx_temp_stubbe
+    name: "RX Temp Stubbe"
+    entity_category: diagnostic
+    unit_of_measurement: "°C"
+    min_value: -50
+    max_value: 100
+    step: 0.1
+    optimistic: false
+    internal: true
+    set_action:
+      - sensor.template.publish:
+          id: hm_stubbe_temp
+          state: !lambda 'return x;'
+
+  - platform: template
+    id: rx_hum_stubbe
+    name: "RX Hum Stubbe"
+    entity_category: diagnostic
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 1
+    optimistic: false
+    internal: true
+    set_action:
+      - sensor.template.publish:
+          id: hm_stubbe_humidity
+          state: !lambda 'return x;'
+
+  - platform: template
+    id: rx_temp_greenhouse
+    name: "RX Temp Greenhouse"
+    entity_category: diagnostic
+    unit_of_measurement: "°C"
+    min_value: -50
+    max_value: 100
+    step: 0.1
+    optimistic: false
+    internal: true
+    set_action:
+      - sensor.template.publish:
+          id: hm_greenhouse_temp
+          state: !lambda 'return x;'
+
+  - platform: template
+    id: rx_hum_greenhouse
+    name: "RX Hum Greenhouse"
+    entity_category: diagnostic
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 1
+    optimistic: false
+    internal: true
+    set_action:
+      - sensor.template.publish:
+          id: hm_greenhouse_humidity
+          state: !lambda 'return x;'
+
+  - platform: template
+    id: rx_temp_house_north
+    name: "RX Temp House_north"
+    entity_category: diagnostic
+    unit_of_measurement: "°C"
+    min_value: -50
+    max_value: 100
+    step: 0.1
+    optimistic: false
+    internal: true
+    set_action:
+      - sensor.template.publish:
+          id: hm_house_north_temp
+          state: !lambda 'return x;'
+
+  - platform: template
+    id: rx_hum_house_north
+    name: "RX Hum House_north"
+    entity_category: diagnostic
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 1
+    optimistic: false
+    internal: true
+    set_action:
+      - sensor.template.publish:
+          id: hm_house_north_humidity
+          state: !lambda 'return x;'
+
+  - platform: template
+    id: rx_temp_house_south
+    name: "RX Temp House_south"
+    entity_category: diagnostic
+    unit_of_measurement: "°C"
+    min_value: -50
+    max_value: 100
+    step: 0.1
+    optimistic: false
+    internal: true
+    set_action:
+      - sensor.template.publish:
+          id: hm_house_south_temp
+          state: !lambda 'return x;'
+
+  - platform: template
+    id: rx_hum_house_south
+    name: "RX Hum House_south"
+    entity_category: diagnostic
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 1
+    optimistic: false
+    internal: true
+    set_action:
+      - sensor.template.publish:
+          id: hm_house_south_humidity
+          state: !lambda 'return x;'
+
+  - platform: template
+    id: rx_temp_house_east
+    name: "RX Temp House_east"
+    entity_category: diagnostic
+    unit_of_measurement: "°C"
+    min_value: -50
+    max_value: 100
+    step: 0.1
+    optimistic: false
+    internal: true
+    set_action:
+      - sensor.template.publish:
+          id: hm_house_east_temp
+          state: !lambda 'return x;'
+
+  - platform: template
+    id: rx_hum_house_east
+    name: "RX Hum House_east"
+    entity_category: diagnostic
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 1
+    optimistic: false
+    internal: true
+    set_action:
+      - sensor.template.publish:
+          id: hm_house_east_humidity
+          state: !lambda 'return x;'
+
+  - platform: template
+    id: rx_temp_house_west
+    name: "RX Temp House_west"
+    entity_category: diagnostic
+    unit_of_measurement: "°C"
+    min_value: -50
+    max_value: 100
+    step: 0.1
+    optimistic: false
+    internal: true
+    set_action:
+      - sensor.template.publish:
+          id: hm_house_west_temp
+          state: !lambda 'return x;'
+
+  - platform: template
+    id: rx_hum_house_west
+    name: "RX Hum House_west"
+    entity_category: diagnostic
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 1
+    optimistic: false
+    internal: true
+    set_action:
+      - sensor.template.publish:
+          id: hm_house_west_humidity
+          state: !lambda 'return x;'
+
+  # --- EXISTING BOILER NUMBERS ---
   - platform: template
     name: "HK2 Flow Target Temp"
     id: heating_setpoint_holding
@@ -286,7 +488,7 @@ number:
     step: 1
     optimistic: false
     initial_value: 0
-    restore_value: true 
+    restore_value: true
     internal: true
     set_action:
       - lambda: |-
@@ -318,6 +520,39 @@ number:
     optimistic: true
     restore_value: true
 
+  - platform: template
+    name: "Stubbe Target Temp (Master)"
+    id: stubbe_target_temp
+    unit_of_measurement: "°C"
+    min_value: 5
+    max_value: 30
+    step: 0.5
+    initial_value: 20.5
+    optimistic: true
+    restore_value: true
+
+  - platform: template
+    name: "Stubbe Delta (Master)"
+    id: stubbe_delta
+    unit_of_measurement: "°C"
+    min_value: 0.5
+    max_value: 5
+    step: 0.5
+    initial_value: 2.0
+    optimistic: true
+    restore_value: true
+
+  - platform: template
+    name: "Stubbe Margin (Master)"
+    id: stubbe_margin
+    unit_of_measurement: "°C"
+    min_value: 0.5
+    max_value: 1
+    step: 0.1
+    initial_value: 0.5
+    optimistic: true
+    restore_value: true
+
   - platform: modbus_controller
     modbus_controller_id: lambdatronic
     id: hk2_flow_setpoint_external
@@ -333,31 +568,6 @@ number:
     register_type: holding
     value_type: U_WORD
     internal: true
-
-  # Irrigation
-  - platform: template
-    name: "Valve Timer"
-    id: valve_countdown
-    icon: "mdi:timer-sand"
-    min_value: 0
-    max_value: 180
-    step: 1
-    initial_value: 0
-    unit_of_measurement: "min"
-    mode: slider
-    optimistic: true
-    on_value:
-      then:
-        - if:
-            condition:
-              lambda: 'return x > 0 && !id(relay_valve).state;'
-            then:
-              - switch.turn_on: relay_valve
-        - if:
-            condition:
-              lambda: 'return x == 0 && id(relay_valve).state;'
-            then:
-              - switch.turn_off: relay_valve
 
 # ----------------------------------------------------------------------
 # 5. DECISION ENGINE
@@ -387,13 +597,17 @@ interval:
           else if (id(heating_countdown_seconds) > 0) final_target = id(heating_setpoint_holding).state; 
           else final_target = id(internal_schedule_target);
 
-          id(write_modbus_target).execute(final_target);
+          static float last_sent = NAN;
+          if (final_target > 0.1f || std::isnan(last_sent) || fabs(final_target - last_sent) > 0.1f) {
+            id(write_modbus_target).execute(final_target);
+            last_sent = final_target;
+          }
 
   - interval: 1s
     then:
       - lambda: |-
           if (id(heating_countdown_seconds) > 0) id(heating_countdown_seconds)--;
-          id(esp_status).update(); 
+          id(esp_status).update();
 
   - interval: 60s
     then:
@@ -408,44 +622,87 @@ interval:
           id: modbus_status
           state: !lambda 'return !std::isnan(id(boiler_temp_actual).state);'
 
-  # Irrigation Countdown
-  - interval: 60s
-    then:
-      - if:
-          condition:
-            lambda: 'return !std::isnan(id(valve_countdown).state) && id(valve_countdown).state > 0;'
-          then:
-            - number.set:
-                id: valve_countdown
-                value: !lambda 'return id(valve_countdown).state - 1;'
-
-  # Irrigation Schedule Checker (Optimized 10s Sequential)
-  - interval: 10s
-    then:
-      - lambda: |-
-          if (id(valve_schedule).state.empty()) return;
-
-          auto now = id(sntp_time).now();
-          if (now.is_valid()) {
-            std::string state = id(valve_schedule).state;
-            size_t at_pos = state.find('@');
-            std::string sch_time = (at_pos != std::string::npos) ? state.substr(0, at_pos) : state;
-            
-            int sch_h, sch_m;
-            if (sscanf(sch_time.c_str(), "%d:%d", &sch_h, &sch_m) == 2) {
-              if (now.hour == sch_h && now.minute == sch_m) {
-                int sch_dur = (at_pos != std::string::npos) ? atoi(state.substr(at_pos + 1).c_str()) : 60;
-                ESP_LOGI("irrigation", "Match found! Starting valve for %d minutes", sch_dur);
-                id(valve_countdown).make_call().set_value(sch_dur).perform();
-                id(valve_schedule).publish_state("");
-              }
-            }
-          }
-
 # ----------------------------------------------------------------------
-# 6. SENSORS
+# 6. SENSORS (Now read-only as requested!)
 # ----------------------------------------------------------------------
 sensor:
+  - platform: uptime
+    name: "Uptime"
+    id: froeling_uptime
+  # --- READ ONLY DISPLAYS FOR THE UI ---
+  - platform: template
+    id: hm_stubbe_temp
+    name: "Temp Stubbe (HM)"
+    unit_of_measurement: "°C"
+    device_class: temperature
+
+  - platform: template
+    id: hm_stubbe_humidity
+    name: "Humidity Stubbe (HM)"
+    unit_of_measurement: "%"
+    device_class: humidity
+
+  - platform: template
+    id: hm_greenhouse_temp
+    name: "Temp Greenhouse (HM)"
+    unit_of_measurement: "°C"
+    device_class: temperature
+
+  - platform: template
+    id: hm_greenhouse_humidity
+    name: "Humidity Greenhouse (HM)"
+    unit_of_measurement: "%"
+    device_class: humidity
+
+  - platform: template
+    id: hm_house_north_temp
+    name: "Temp House North (HM)"
+    unit_of_measurement: "°C"
+    device_class: temperature
+
+  - platform: template
+    id: hm_house_north_humidity
+    name: "Humidity House North (HM)"
+    unit_of_measurement: "%"
+    device_class: humidity
+
+  - platform: template
+    id: hm_house_south_temp
+    name: "Temp House South (HM)"
+    unit_of_measurement: "°C"
+    device_class: temperature
+
+  - platform: template
+    id: hm_house_south_humidity
+    name: "Humidity House South (HM)"
+    unit_of_measurement: "%"
+    device_class: humidity
+
+  - platform: template
+    id: hm_house_east_temp
+    name: "Temp House East (HM)"
+    unit_of_measurement: "°C"
+    device_class: temperature
+
+  - platform: template
+    id: hm_house_east_humidity
+    name: "Humidity House East (HM)"
+    unit_of_measurement: "%"
+    device_class: humidity
+
+  - platform: template
+    id: hm_house_west_temp
+    name: "Temp House West (HM)"
+    unit_of_measurement: "°C"
+    device_class: temperature
+
+  - platform: template
+    id: hm_house_west_humidity
+    name: "Humidity House West (HM)"
+    unit_of_measurement: "%"
+    device_class: humidity
+
+  # --- EXISTING SENSORS ---
   - platform: homeassistant
     id: ha_target_flow_helper
     entity_id: input_number.target_flow_temp
@@ -784,7 +1041,7 @@ sensor:
     internal: true
 
   - platform: dallas_temp
-    name: "Temp Outside"
+    name: "Temp Outdoor"
     id: dallas_outside_temp
     address: 0xe3000000b318b828  
     update_interval: 60s
@@ -793,7 +1050,7 @@ sensor:
     name: "Temp Heating Room"
     address: 0xa6000000b3211a28
     update_interval: 60s
-
+    
   - platform: dallas_temp
     name: "Temp Solar Flow"
     address: 0xc6000000b2f2a128 
@@ -808,7 +1065,6 @@ sensor:
     name: "HK2 Flow Return Temp"
     address: 0x34000000b2c61328 
     update_interval: 60s
-
 
 # ----------------------------------------------------------------------
 # 7. BINARY SENSORS
@@ -892,19 +1148,20 @@ binary_sensor:
     entity_category: diagnostic
     device_class: running
 
-  # Irrigation
-  - platform: gpio
-    pin:
-      number: GPIO23 # <--- Physical button pin
-      mode:
-        input: true
-        pullup: true
-      inverted: true
-    name: "Valve Physical Button"
-    id: physical_valve_button
-    internal: true
-    on_press:
-      - switch.toggle: relay_valve
+  - platform: template
+    name: "Ethernet Link Status"
+    id: eth_link_status
+    device_class: connectivity
+    entity_category: diagnostic
+    lambda: 'return id(eth_link).is_connected();'
+    on_state:
+      then:
+        - if:
+            condition:
+              lambda: 'return x;' 
+            then:
+              - component.update: lambdatronic
+              - logger.log: "Network restored: Forced Modbus sync."
 
 # ----------------------------------------------------------------------
 # 8. TEXT SENSORS
@@ -965,40 +1222,40 @@ text_sensor:
         case 28: return std::string("Remaining feed");
         case 29: return std::string("Refill stoker");
         case 30: return std::string("Heat up lambda probe");
-        case 31: return std::string("Gebläsenachlauf I");
-        case 32: return std::string("Gebläsenachlauf II");
-        case 33: return std::string("Abgestellt");
-        case 34: return std::string("Nachzünden");
-        case 35: return std::string("Zünden Warten");
+        case 31: return std::string("Fan post-run I");
+        case 32: return std::string("Fan post-run II");
+        case 33: return std::string("Stopped");
+        case 34: return std::string("Re-ignite");
+        case 35: return std::string("Ignition wait");
         case 36: return std::string("FB: Close RSE");
-        case 37: return std::string("FB: Kessel belüften");
-        case 38: return std::string("FB: Zünden");
-        case 39: return std::string("FB: min. Einschub");
+        case 37: return std::string("FB: Ventilate boiler");
+        case 38: return std::string("FB: Ignite");
+        case 39: return std::string("FB: min. feed");
         case 40: return std::string("Close RSE");
         case 41: return std::string("MALFUNCTION: STB/NA");
-        case 42: return std::string("MALFUNCTION: Kipprost");
-        case 43: return std::string("MALFUNCTION: FR-Überdr.");
-        case 44: return std::string("MALFUNCTION: Türkont.");
-        case 45: return std::string("MALFUNCTION: Saugzug");
-        case 46: return std::string("MALFUNCTION: Umfeld");
-        case 47: return std::string("FEHLER: STB/NA");
-        case 48: return std::string("FEHLER: Kipprost");
-        case 49: return std::string("FEHLER: FR-Überdr.");
-        case 50: return std::string("FEHLER: Türkont.");
-        case 51: return std::string("FEHLER: Saugzug");
-        case 52: return std::string("FEHLER: Umfeld");
-        case 53: return std::string("FEHLER: Stoker");
+        case 42: return std::string("MALFUNCTION: Tilting grate");
+        case 43: return std::string("MALFUNCTION: FR overpressure");
+        case 44: return std::string("MALFUNCTION: Door contact");
+        case 45: return std::string("MALFUNCTION: Induced draught fan");
+        case 46: return std::string("MALFUNCTION: Environment");
+        case 47: return std::string("ERROR: STB/NA");
+        case 48: return std::string("ERROR: Tilting grate");
+        case 49: return std::string("ERROR: FR overpressure");
+        case 50: return std::string("ERROR: Door contact");
+        case 51: return std::string("ERROR: Induced draught fan");
+        case 52: return std::string("ERROR: Environment");
+        case 53: return std::string("ERROR: Stoker");
         case 54: return std::string("MALFUNCTION: Stoker");
-        case 55: return std::string("FB: Stoker leeren.");
-        case 56: return std::string("Vorbelüften");
-        case 57: return std::string("MALFUNCTION: Hackgut");
-        case 58: return std::string("FEHLER: Hackgut");
-        case 59: return std::string("NB: Tür offen");
-        case 60: return std::string("NB: Anheizen");
-        case 61: return std::string("NB: Heizen");
+        case 55: return std::string("FB: Empty stoker");
+        case 56: return std::string("Pre-ventilate");
+        case 57: return std::string("MALFUNCTION: Wood chips");
+        case 58: return std::string("ERROR: Wood chips");
+        case 59: return std::string("NB: Door open");
+        case 60: return std::string("NB: Heating up");
+        case 61: return std::string("NB: Heating");
         case 62: return std::string("ERROR: STB/NA");
         case 63: return std::string("ERROR: General");
-        case 64: return std::string("NB: Feuer Aus");
+        case 64: return std::string("NB: Fire off");
         case 65: return std::string("Self-test active");
         case 66: return std::string("Troubleshooting 20min");
         case 67: return std::string("ERROR: Drop shaft");
@@ -1019,7 +1276,7 @@ text_sensor:
         case 82: return std::string("Sensor check");
         default: return "Unknown (" + to_string(value) + ")";
       }
-
+      
   - platform: template
     name: "Boiler System State"
     id: system_state_text
@@ -1037,7 +1294,7 @@ text_sensor:
       }
 
 # ----------------------------------------------------------------------
-# 8. SELECTS
+# 9. SELECTS
 # ----------------------------------------------------------------------
 select:
   - platform: modbus_controller
@@ -1048,28 +1305,3 @@ select:
     value_type: U_WORD
     optionsmap: {"Off": 0, "On": 1}
     optimistic: false
-
-# ----------------------------------------------------------------------
-# 9. Irrigation Switch
-# ----------------------------------------------------------------------
-switch:
-  - platform: gpio
-    pin: 
-      number: GPIO22
-      inverted: true  # This fixes the "Active Low" relay logic
-    name: "Valve Power"
-    id: relay_valve
-    icon: "mdi:water-pump"
-    restore_mode: ALWAYS_OFF # Ensures the valve stays closed on reboot
-    on_turn_on:
-      - if:
-          condition:
-            lambda: 'return id(valve_countdown).state == 0 || std::isnan(id(valve_countdown).state);'
-          then:
-            - number.set:
-                id: valve_countdown
-                value: 60
-    on_turn_off:
-      - number.set:
-          id: valve_countdown
-          value: 0
