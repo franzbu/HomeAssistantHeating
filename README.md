@@ -4,7 +4,7 @@
 ![AppDaemon](https://img.shields.io/badge/AppDaemon-Python-yellow?logo=python)
 ![ESPHome](https://img.shields.io/badge/ESPHome-ready-black?logo=espressif)
 
-First things first: Here is what your heating automation could look like (and yes, the colors for the rooms, in this case 'Stubbe' and 'Blue Room', carry meaning; so one glance suffices to know whether a room is currently heating, in heating demand, or off).
+First things first: Here is what your heating automation could look like.
 
 <img width="913" height="519" alt="Screenshot 2026-02-19 at 1 04 55 PM" src="https://github.com/user-attachments/assets/b7a57efd-a91c-4d96-a5c9-da20839213f9" />
 
