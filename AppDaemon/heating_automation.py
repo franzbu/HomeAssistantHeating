@@ -1,5 +1,7 @@
+
 import hassapi as hass  # type: ignore
 from datetime import datetime, timedelta, time
+import re
 
 # ==================================================================================================
 # ROOM DEMAND CALCULATOR
@@ -10,17 +12,30 @@ class RoomDemandCalculator(hass.Hass):
         # Extract location from app name to allow code reuse across multiple rooms
         self.location = self.name.removeprefix("heating_") 
         self.sensor_temp = self.gl.get_room_temp(self.location)
-        self.mode_mapping = {'Standard': 'standard', 'Holiday': 'holiday', 'Temporary': 'temp', 'Party': 'party'}
+        self.mode_mapping = {'Standard': 'standard', 'Holiday': 'holiday', 'Temporary': 'temp', 'Party': 'party', 'Google Calendar': 'calendar'}
         self.delay_timer = None
+        self.calendar_cache = []
+        self.calendar_entity = f"calendar.heating_{self.location}"
+        self.calendar_timers = []
+        self.calendar_sync_timer = None
 
-        # Dynamically build schedule list to ensure the app reacts to all potential mode changes
-        self.my_schedules = [f'schedule.{s}_{self.location}' for s in list(self.mode_mapping.values()) + ['off']]
+        # Dynamically build schedule list to ensure the app reacts to all potential mode changes, excluding calendar
+        self.my_schedules = [f'schedule.{s}_{self.location}' for s in list(self.mode_mapping.values()) if s != 'calendar']
+        self.my_schedules.append(f'schedule.off_{self.location}')
         
         for sched in self.my_schedules:
             if self.entity_exists(sched):
                 self.listen_state(self.callback_debounced_refresh, sched)
                 self.listen_state(self.callback_debounced_refresh, sched, attribute='temp')
                 self.listen_state(self.callback_debounced_refresh, sched, attribute='next_event')
+
+        # Calendar Listeners
+        if self.entity_exists(self.calendar_entity):
+            # Listen to ALL attribute changes (catches newly added events or back-to-back updates)
+            self.listen_state(self.on_calendar_state_change, self.calendar_entity, attribute="all")
+            self.run_daily(self.update_calendar_cache, "03:00:00")
+            
+        self.listen_event(self.manual_calendar_refresh, "HEATING_CALENDAR_SYNC")
 
         self.listen_event(self.on_config_change, "entity_registry_updated")
         self.listen_state(self.callback_debounced_refresh, f'input_select.heating_schedule_{self.location}')
@@ -29,8 +44,8 @@ class RoomDemandCalculator(hass.Hass):
         self.listen_state(self.callback_temp_sensor, self.sensor_temp)
 
         # SUN COMPENSATION: Listen to Garten Temp and the room-specific helper
-        self.garten_temp_sensor = self.gl.get_outdoor_temp("garten_temp")
         self.sun_comp_helper = f"input_number.sun_compensation_{self.location}"
+        self.garten_temp_sensor = self.gl.get_outdoor_temp("garten_temp")
         
         self.listen_state(self.callback_temp_sensor, self.garten_temp_sensor)
         if self.entity_exists(self.sun_comp_helper):
@@ -68,8 +83,90 @@ class RoomDemandCalculator(hass.Hass):
         delay = 3 if (entity.startswith("schedule.") and new == "on") else 1
         self.delay_timer = self.run_in(self.first_evaluation, delay)
 
+    def on_calendar_state_change(self, entity, attribute, old, new, args):
+        """Triggers a fresh sync if a calendar event is dynamically added or changed."""
+        if self.calendar_sync_timer:
+            try: self.cancel_timer(self.calendar_sync_timer)
+            except: pass
+            
+        # 1. Force the HA Template Sensors to update by "pressing" the button
+        self.call_service("input_button/press", entity_id="input_button.refresh_calendars")
+        
+        # 2. Wait 5 seconds for HA to finish downloading before reading the cache
+        self.calendar_sync_timer = self.run_in(self.delayed_calendar_sync, 5)
+
+    def delayed_calendar_sync(self, kwargs):
+        self.calendar_sync_timer = None
+        self.update_calendar_cache()
+
+    def update_calendar_cache(self, kwargs=None):
+        # We now read the HA Template Sensors to bypass the AppDaemon API bug
+        sensor_entity = f"sensor.calendar_events_{self.location}"
+        
+        if not self.entity_exists(sensor_entity):
+            self.refresh_logic()
+            self.prepare_dashboard_next_event() 
+            return
+        
+        try:
+            # Get the list of events from the sensor attribute we created in YAML
+            events = self.get_state(sensor_entity, attribute="events")
+            self.calendar_cache = events if isinstance(events, list) else []
+            
+            # Rebuild the internal timers for start/end of events
+            self.setup_calendar_watchdogs()
+            self.refresh_logic()
+            self.prepare_dashboard_next_event() 
+        except Exception as e:
+            self.log(f"Calendar Sync Error: {e}", level="WARNING")
+            self.update_dashboard_msg('Calendar sync failed.')
+
+    def setup_calendar_watchdogs(self):
+        """Creates precise internal triggers for the exact start/end moments of cached events."""
+        for t in self.calendar_timers:
+            try: self.cancel_timer(t)
+            except: pass
+        self.calendar_timers = []
+        
+        now = datetime.now().astimezone()
+        for event in self.calendar_cache:
+            try:
+                start_dt = datetime.fromisoformat(event['start'].replace('Z', '+00:00')).astimezone()
+                end_dt = datetime.fromisoformat(event['end'].replace('Z', '+00:00')).astimezone()
+                
+                if start_dt > now:
+                    t = self.run_at(self.calendar_watchdog_trigger, start_dt + timedelta(seconds=1))
+                    self.calendar_timers.append(t)
+                if end_dt > now:
+                    t = self.run_at(self.calendar_watchdog_trigger, end_dt + timedelta(seconds=1))
+                    self.calendar_timers.append(t)
+            except Exception:
+                continue
+
+    def calendar_watchdog_trigger(self, kwargs):
+        self.refresh_logic()
+        self.prepare_dashboard_next_event()
+
+    def manual_calendar_refresh(self, event_name, data, kwargs):
+        # Give HA's Template Sensor 5 seconds to fetch data from Google before reading it
+        self.run_in(self.update_calendar_cache, 5)
+
+    def get_active_calendar_event(self):
+        now = datetime.now().astimezone()
+        for event in self.calendar_cache:
+            start = datetime.fromisoformat(event['start'].replace('Z', '+00:00')).astimezone()
+            end = datetime.fromisoformat(event['end'].replace('Z', '+00:00')).astimezone()
+            if start <= now <= end:
+                return event
+        return None
+
     def first_evaluation(self, kwargs):
         self.delay_timer = None
+        
+        mode = self.get_state(f'input_select.heating_schedule_{self.location}')
+        if mode == "Google Calendar" and not self.calendar_cache:
+            self.update_calendar_cache()
+            return
 
         curr_sched = self.current_schedule()
         is_active = self.current_schedule_active()
@@ -81,7 +178,7 @@ class RoomDemandCalculator(hass.Hass):
         # RACE CONDITION CHECK:
         # We only retry if the schedule is ON but BOTH attributes are missing.
         # If next_event exists but temp doesn't, it's a valid "No Temp" schedule.
-        if is_active and (sched_temp is None) and (next_event is None or next_event == "None"):
+        if is_active and mode != "Google Calendar" and (sched_temp is None) and (next_event is None or next_event == "None"):
             retry_count = kwargs.get("retry_count", 0)
             if retry_count < 2:
                 self.log(f"⚠️ {curr_sched} is active but appears unloaded. Retrying in 5s...")
@@ -93,13 +190,14 @@ class RoomDemandCalculator(hass.Hass):
         self.prepare_dashboard_next_event()
 
     def callback_master_switch(self, entity, attribute, old, new, args):
-        force_start = (new == "Heating" and old != "Heating")
+        force_start = (new in ["Heating", "OnFire"] and old not in ["Heating", "OnFire"])
         self.evaluate_heating_claim(force_start=force_start)
 
     def callback_temp_sensor(self, entity, attribute, old, new, args):
         self.evaluate_heating_claim() 
 
     def refresh_logic(self, force_reset=False):
+        mode = self.get_state(f'input_select.heating_schedule_{self.location}')
         curr_sched = self.current_schedule()
         
         if curr_sched == f'schedule.off_{self.location}':
@@ -110,7 +208,17 @@ class RoomDemandCalculator(hass.Hass):
             self.update_sun_sensor(0.0)
             return 
 
-        if self.current_schedule_active():
+        if mode == "Google Calendar":
+            active_event = self.get_active_calendar_event()
+            if active_event:
+                summary = active_event.get('summary', '')
+                try:
+                    target = float(re.findall(r"[-+]?\d*\.\d+|\d+", summary)[0])
+                except:
+                    target = self.heat_temp()
+            else:
+                target = self.base_temp()
+        elif self.current_schedule_active():
             sched_temp = self.get_state(curr_sched, attribute='temp')
             try: 
                 target = float(sched_temp)
@@ -129,7 +237,7 @@ class RoomDemandCalculator(hass.Hass):
         self.evaluate_heating_claim(override_target=effective_target, force_reset=force_reset)
 
     def evaluate_heating_claim(self, override_target=None, force_reset=False, force_start=False):
-        if self.get_state("input_select.heating_mode") == "Off":
+        if self.get_state("input_select.heating_mode") in ["Off", "Pause"]:
             self.update_heating_claim(False)
             self.update_boost_attributes(0.0, 0.0, "off")
             self.update_sun_sensor(0.0)
@@ -289,6 +397,9 @@ class RoomDemandCalculator(hass.Hass):
         return f'schedule.{suffix}_{self.location}'
     
     def current_schedule_active(self):
+        mode = self.get_state(f'input_select.heating_schedule_{self.location}')
+        if mode == "Google Calendar":
+            return self.get_active_calendar_event() is not None
         return self.get_state(self.current_schedule()) == 'on'
 
     def set_target_temp(self, x):
@@ -307,9 +418,50 @@ class RoomDemandCalculator(hass.Hass):
         self.call_service("input_text/set_value", entity_id=f'input_text.next_event_{self.location}', value=msg)
 
     def prepare_dashboard_next_event(self):
-        curr_sched = self.current_schedule()
-        self.last_schedule_response = self.call_service("schedule/get_schedule", entity_id=curr_sched)
-        self.run_in(self.calculate_relay_chain, 1, sched_entity=curr_sched)
+        mode = self.get_state(f'input_select.heating_schedule_{self.location}')
+        if mode == "Google Calendar":
+            self.calculate_calendar_relay_chain()
+        else:
+            curr_sched = self.current_schedule()
+            self.last_schedule_response = self.call_service("schedule/get_schedule", entity_id=curr_sched)
+            self.run_in(self.calculate_relay_chain, 1, sched_entity=curr_sched)
+
+    def calculate_calendar_relay_chain(self):
+        if not self.calendar_cache:
+            self.update_dashboard_msg('No calendar data cached.')
+            return
+
+        now = datetime.now().astimezone()
+        active_event = self.get_active_calendar_event()
+
+        if active_event:
+            current_end = datetime.fromisoformat(active_event['end'].replace('Z', '+00:00')).astimezone()
+            limit_dt = now + timedelta(days=7)
+            while current_end < limit_dt:
+                found_next = False
+                for event in self.calendar_cache:
+                    evt_start = datetime.fromisoformat(event['start'].replace('Z', '+00:00')).astimezone()
+                    if abs((evt_start - current_end).total_seconds()) <= 65:
+                        current_end = datetime.fromisoformat(event['end'].replace('Z', '+00:00')).astimezone()
+                        found_next = True
+                        break
+                if not found_next:
+                    break
+            msg = f"Heating stops at {self.format_time_msg(current_end)}"
+        else:
+            upcoming = []
+            for event in self.calendar_cache:
+                evt_start = datetime.fromisoformat(event['start'].replace('Z', '+00:00')).astimezone()
+                if evt_start > now:
+                    upcoming.append(evt_start)
+            
+            if upcoming:
+                next_start = min(upcoming)
+                msg = f"Heating starts at {self.format_time_msg(next_start)}"
+            else:
+                msg = "No upcoming events found."
+
+        self.update_dashboard_msg(msg)
 
     def calculate_relay_chain(self, kwargs):
         if self.delay_timer is not None:
@@ -371,6 +523,8 @@ class RoomDemandCalculator(hass.Hass):
 class HeatSupplyManager(hass.Hass):
     def initialize(self):
         # PHASE 1: Static Initialization (Runs ONCE)
+        self.startup_time = datetime.now()
+        self.stabilization_scheduled = False
         self.gl = self.get_app("global_config")
         raw_deps = self.args.get('dependencies', [])
         self.managed_locations = [d.replace("heating_", "") for d in raw_deps if d not in ["global_config", "heat_supply_manager"]]
@@ -380,11 +534,15 @@ class HeatSupplyManager(hass.Hass):
         self.mode_select = "input_select.heating_mode"
 
         self.ext_temp_sensors = self.gl.get_outdoor_sensor_hierarchy()
-        self.telegram_target = self.args.get('telegram_id') 
+        self.telegram_chat_id = self.args.get('telegram_id') 
         
         self.debounce_timer = None
         self.claim_start_times = {} 
         self.startup_timer = None
+
+        self.fallback_timer = None
+        self.run_daily(self.reset_pause, time(0, 0, 0))
+        self.run_daily(self.reset_schedules_to_default, time(0, 0, 0))
 
         # Start the health check loop
         self.try_startup()
@@ -475,7 +633,12 @@ class HeatSupplyManager(hass.Hass):
             self.call_service("input_number/set_value", entity_id=self.flow_target_helper, value=new_val)
     
     def on_mode_change(self, entity, attribute, old, new, args):
-        if new == "Off":
+        # Update our persistent timestamp helper to survive HA reboots
+        if self.entity_exists("input_datetime.heating_mode_last_changed"):
+            now_ts = datetime.now().timestamp()
+            self.call_service("input_datetime/set_datetime", entity_id="input_datetime.heating_mode_last_changed", timestamp=now_ts)
+
+        if new in ["Off", "Pause"]:
             self._set_flow_target(0)
             return
         if old == "Heating" and new == "Auto":
@@ -498,11 +661,86 @@ class HeatSupplyManager(hass.Hass):
         self.debounce_timer = None
         self.evaluate_heating_pump()
 
+    def reset_pause(self, kwargs):
+        if self.get_state(self.mode_select) == "Pause":
+            self.call_service("input_select/select_option", entity_id=self.mode_select, option="Auto")
+
+    def reset_schedules_to_default(self, kwargs):
+        # 1. Abort the midnight reset if the system is currently OnFire
+        if self.get_state(self.mode_select) == "OnFire":
+            self.log("Midnight reset skipped: System is currently OnFire.", level="INFO")
+            return
+
+        for loc in self.managed_locations:
+            schedule_entity = f"input_select.heating_schedule_{loc}"
+            default_entity = f"input_select.default_heating_schedule_{loc}"
+            
+            if self.entity_exists(default_entity) and self.entity_exists(schedule_entity):
+                default_val = self.get_state(default_entity)
+                current_val = self.get_state(schedule_entity)
+                
+                # 2. Only fire the service call if the state actually needs to change
+                if default_val and current_val != default_val:
+                    self.call_service("input_select/select_option", entity_id=schedule_entity, option=default_val)
+
+    def execute_mode_fallback(self, kwargs):
+        self.fallback_timer = None
+        fallback_mode = kwargs.get("fallback_mode")
+        
+        # Verify mode hasn't changed manually while we were waiting
+        if self.get_state(self.mode_select) == fallback_mode:
+            self.call_service("input_select/select_option", entity_id=self.mode_select, option="Auto")
+            if fallback_mode == "Party" and self.telegram_chat_id:
+                self.notify(self.telegram_chat_id, "🛑 Party Mode Ended", "Valves remained closed (< 15%).", True)
+
     def evaluate_heating_pump(self):
+        # Prevent spike on HA restart by giving RoomDemandCalculator 10s to clear stale restored claims
+        time_since_boot = (datetime.now() - self.startup_time).total_seconds()
+        if time_since_boot < 10:
+            self._set_flow_target(0)
+            if not self.stabilization_scheduled:
+                self.stabilization_scheduled = True
+                self.run_in(self.retry_evaluation, int(11 - time_since_boot))
+            return
+
         mode = self.get_state(self.mode_select)
 
-        if mode == "Off": 
+        # --- SAFETY NET FOR PAUSE MODE ---
+        if mode == "Pause":
+            last_updated = None
+            
+            # 1. Try persistent helper first (survives HA reboots)
+            if self.entity_exists("input_datetime.heating_mode_last_changed"):
+                timestamp_str = self.get_state("input_datetime.heating_mode_last_changed")
+                if timestamp_str and timestamp_str not in ["unknown", "unavailable"]:
+                    try:
+                        # input_datetime format is typically 'YYYY-MM-DD HH:MM:SS'
+                        dt_naive = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+                        # Localize it to current timezone
+                        last_updated = dt_naive.astimezone()
+                    except Exception as e:
+                        self.log(f"Error parsing input_datetime: {e}", level="WARNING")
+
+            # 2. Fallback to HA state attribute (vulnerable to reboots)
+            if not last_updated:
+                state_obj = self.get_state(self.mode_select, attribute="all")
+                if state_obj and state_obj.get("last_changed"):
+                    try:
+                        last_updated = datetime.fromisoformat(state_obj["last_changed"].replace("Z", "+00:00")).astimezone()
+                    except Exception as e:
+                        self.log(f"Pause safety net error: {e}", level="WARNING")
+            
+            # Evaluate against current date
+            if last_updated:
+                if last_updated.date() < datetime.now().astimezone().date():
+                    self.call_service("input_select/select_option", entity_id=self.mode_select, option="Auto")
+                    return # Stop here, the state change will trigger a fresh evaluation
+
+        if mode in ["Off", "Pause"]: 
             self._set_flow_target(0)
+            if self.fallback_timer:
+                self.cancel_timer(self.fallback_timer)
+                self.fallback_timer = None
             return
 
         now = datetime.now()
@@ -518,6 +756,8 @@ class HeatSupplyManager(hass.Hass):
                          if (now - start).total_seconds() >= user_duration]
 
         should_heat = False
+        party_fallback_met = False
+        heating_fallback_met = False
         
         if mode == "Party":
             max_valve = 0.0
@@ -530,51 +770,85 @@ class HeatSupplyManager(hass.Hass):
                         val = float(self.get_state(valve_entity) or 0)
                         if val > max_valve: max_valve = val
                     except: pass
-            if found_valves and max_valve < 20.0:
-                self.call_service("input_select/select_option", entity_id=self.mode_select, option="Auto")
-                if self.telegram_target:
-                    self.notify(self.telegram_target, "🛑 Party Mode Ended", f"Valves are closed ({max_valve}%).", True)
-                return 
-            should_heat = True
+            if found_valves and max_valve < 15.0:
+                party_fallback_met = True
+            else:
+                should_heat = True
 
         elif active_claims:
             should_heat = True
         else:
-            should_heat = False
-            self._set_flow_target(0)
             if mode == "Heating":
-                self.call_service("input_select/select_option", entity_id=self.mode_select, option="Auto")
+                heating_fallback_met = True
 
-        if should_heat:
-            out_t = 0.0
-            for sensor in self.ext_temp_sensors:
-                raw_out = self.get_state(sensor)
-                if raw_out not in [None, "unavailable", "unknown"]:
-                    try:
-                        out_t = float(raw_out)
-                        break
-                    except ValueError:
-                        pass
-                        
-            adj_factor = float(self.get_state("input_number.baseline_adjustment") or 0.4)
-            baseline = (-adj_factor * out_t) + float(self.get_state("input_number.heating_baseline_0_deg") or 36.0)
+        # Handle the timers for automatic fallbacks
+        if party_fallback_met:
+            state_obj = self.get_state(self.mode_select, attribute="all")
+            party_duration = 0
+            if state_obj and state_obj.get("last_changed"):
+                try:
+                    last_changed_dt = datetime.fromisoformat(state_obj["last_changed"].replace("Z", "+00:00")).astimezone()
+                    party_duration = (datetime.now().astimezone() - last_changed_dt).total_seconds()
+                except Exception:
+                    pass
             
-            max_realized_boost = 0.0
-            for loc in active_claims:
-                realized = float(self.get_state(f"binary_sensor.boost_status_{loc}", attribute="boost") or 0.0)
-                if realized > max_realized_boost:
-                    max_realized_boost = realized
-
-            multi_room_factor = float(self.get_state("input_number.flow_temp_multi_room_offset") or 0.0)
-            multi_room_boost = max(0, len(active_claims) - 1) * multi_room_factor
-
-            calc_target = float(round((baseline + max_realized_boost + multi_room_boost) * 2) / 2)
-            max_f = float(self.get_state("input_number.max_flow_temp") or 45.0)
-            if calc_target > max_f: calc_target = max_f
+            delay = 0 if party_duration > 60 else max(0, int(60 - party_duration))
+            
+            if self.fallback_timer is None:
+                if delay == 0:
+                    self.execute_mode_fallback({"fallback_mode": mode})
+                else:
+                    self.fallback_timer = self.run_in(self.execute_mode_fallback, delay, fallback_mode=mode)
+                    
+        elif heating_fallback_met:
+            if self.fallback_timer is None:
+                self.fallback_timer = self.run_in(self.execute_mode_fallback, 30, fallback_mode=mode)
                 
-            self._set_flow_target(calc_target)
-            if mode != "Heating" and mode != "Party":
-                self.call_service("input_select/select_option", entity_id=self.mode_select, option="Heating")
+        else:
+            if self.fallback_timer is not None:
+                self.cancel_timer(self.fallback_timer)
+                self.fallback_timer = None
 
-    def notify(self, target, title, message, disable_notification=True):
-        self.gl.send_telegram(target, title, message, disable_notification)
+        if not should_heat:
+            self._set_flow_target(0)
+            return
+
+        out_t = 0.0
+        for sensor in self.ext_temp_sensors:
+            raw_out = self.get_state(sensor)
+            if raw_out not in [None, "unavailable", "unknown"]:
+                try:
+                    out_t = float(raw_out)
+                    break
+                except ValueError:
+                    pass
+                    
+        adj_factor = float(self.get_state("input_number.baseline_adjustment") or 0.4)
+        baseline = (-adj_factor * out_t) + float(self.get_state("input_number.heating_baseline_0_deg") or 36.0)
+        
+        max_realized_boost = 0.0
+        for loc in active_claims:
+            realized = float(self.get_state(f"binary_sensor.boost_status_{loc}", attribute="boost") or 0.0)
+            if realized > max_realized_boost:
+                max_realized_boost = realized
+
+        multi_room_factor = float(self.get_state("input_number.flow_temp_multi_room_offset") or 0.0)
+        multi_room_boost = max(0, len(active_claims) - 1) * multi_room_factor
+
+        calc_target = float(round((baseline + max_realized_boost + multi_room_boost) * 2) / 2)
+        max_f = float(self.get_state("input_number.max_flow_temp") or 45.0)
+        if calc_target > max_f: calc_target = max_f
+            
+        self._set_flow_target(calc_target)
+        if mode not in ["Heating", "Party", "OnFire"]:
+            self.call_service("input_select/select_option", entity_id=self.mode_select, option="Heating")
+
+    def notify(self, chat_id, title, message, disable_notification=True):
+        """Standardized Telegram call via GlobalSettings."""
+        # Updated call to use 'chat_id' keyword to match your updated GlobalSettings definition
+        self.gl.send_telegram(
+            chat_id=chat_id,
+            title=title,
+            message=message,
+            disable_notification=disable_notification
+        )
