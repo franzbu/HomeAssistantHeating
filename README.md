@@ -303,7 +303,7 @@ function setupAllHeatingTriggers() {
 }
 ```
 
-Home Assistant Automation (necessary for one room only):
+Home Assistant Automation (this is necessary for only one room):
 ```yaml
 alias: Google Calendar Webhook Receiver
 description: >-
@@ -354,6 +354,8 @@ template:
         attributes:
           events: "{{ agenda['calendar.heating_stubbe']['events'] if agenda is defined else [] }}"
 ```
+
+Make sure to install the Google Calendar integration in Home Assistant.
 
 #### Heating Modes
 
